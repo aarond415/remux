@@ -15,10 +15,18 @@ Built with Python and PyQt6. Works on macOS, Windows, and Linux.
   - Video is always stream-copied (no re-encoding, no quality loss)
   - HEVC files get the `hvc1` codec tag so QuickTime and Apple TV play them correctly
   - Audio is copied if it's already Apple-compatible (AAC, ALAC, MP3, AC3); otherwise re-encoded to AAC 256k
-  - AVI subtitle tracks are dropped (they can't go into an MP4 container)
+  - Image-based subtitle tracks (DVD/Blu-ray bitmap subs) are dropped automatically — they can't go into an MP4 container
+- **TMDb metadata tagging** *(optional)*
+  - Enable "Tag with TMDb metadata" and set your API key in ⚙ Settings
+  - Automatically searches The Movie Database for each file based on its filename
+  - Choose **Movie** or **TV Show** mode — writes the right iTunes atoms for each type
+  - TV Show mode writes `TV Show`, `Season`, `Episode #`, `Album`, `Artist`, and all fields needed for correct iOS/Apple TV season grouping
+  - After each conversion an **artwork picker** appears: scroll through all available TMDb posters and select the one to embed
+  - If the automatic title match is wrong, type a corrected title in the picker and re-search without leaving the screen
+  - Tags and artwork are written via [SublerCLI](https://bitbucket.org/galad87/sublercli)
 - **Editable output paths** — double-click the Output column to rename or redirect any file before converting
 - **Codec info** — each queued file is probed in the background and shows its video/audio codecs, resolution, and duration
-- **Settings** — set a default output folder so converted files always land in one place
+- **Settings** — set a default output folder, TMDb API key, and SublerCLI path
 - **Real-time progress** — live percentage bar per file, driven by ffmpeg's own progress stream
 - **macOS notifications** — get a system notification when the full batch completes
 - **Open output folder** — one click to reveal converted files in Finder after the batch is done
@@ -30,6 +38,8 @@ Built with Python and PyQt6. Works on macOS, Windows, and Linux.
 
 - Python 3.9+
 - [ffmpeg](https://ffmpeg.org/) (includes ffprobe) — must be in your PATH
+- [SublerCLI](https://bitbucket.org/galad87/sublercli) — only needed for TMDb metadata tagging
+- A free [TMDb API key](https://www.themoviedb.org/settings/api) — only needed for TMDb metadata tagging
 
 ---
 
@@ -72,8 +82,18 @@ python remux_ui.py
 2. **Edit output filenames** by double-clicking the Output column in the queue. Type a bare filename to keep the same folder, or a full path to redirect.
 3. **Set a default output folder** via ⚙ Settings if you always want files to land in one place.
 4. **Check "Delete originals"** if you want the source files removed after a successful conversion.
-5. Click **Convert All** and watch the progress bar. Each file's status updates in the queue.
-6. When the batch finishes, click **📂 Open output folder** to jump straight to the results.
+5. *(Optional)* **Check "Tag with TMDb metadata"**, choose Movie or TV Show, then click **Convert All**. After each file converts, an artwork picker will appear — select a poster and confirm.
+6. Click **Convert All** and watch the progress bar. Each file's status updates in the queue.
+7. When the batch finishes, click **📂 Open output folder** to jump straight to the results.
+
+### Setting up TMDb tagging
+
+1. Get a free API key at [themoviedb.org/settings/api](https://www.themoviedb.org/settings/api)
+2. Install SublerCLI: `brew install sublercli` (or download from [bitbucket.org/galad87/sublercli](https://bitbucket.org/galad87/sublercli))
+3. Open ⚙ Settings in Remux, paste your TMDb API key, and confirm the SublerCLI path
+4. Check **"Tag with TMDb metadata"** before converting
+
+Remux parses the title and year from the filename to find the right TMDb entry. If the automatic match is wrong, the artwork picker has a search field — type the correct title and press Search to re-query.
 
 ---
 
