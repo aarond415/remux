@@ -246,15 +246,19 @@ class ConvertWorker(QThread):
             return
 
         ext       = os.path.splitext(self.item.src)[1].lower()
-        drop_subs = ext == ".avi" or has_image_subs
+        is_avi    = ext == ".avi"
+        drop_subs = is_avi or has_image_subs
 
         video_args = ["-c:v", "copy"] + (["-tag:v", "hvc1"] if vc == "hevc" else [])
-        audio_args = ["-c:a", "aac", "-b:a", "256k"] if ac not in APPLE_AUDIO else ["-c:a", "copy"]
+        # AVI MP3 uses a broken codec tag (0x0055) that doesn't survive remux to MP4 cleanly;
+        # always re-encode audio from AVI files.
+        need_reencode = ac not in APPLE_AUDIO or is_avi
+        audio_args = ["-c:a", "aac", "-b:a", "256k"] if need_reencode else ["-c:a", "copy"]
         sub_args   = ["-sn"] if drop_subs else ["-c:s", "mov_text"]
 
         self.log.emit(f"▶ {os.path.basename(self.item.src)}")
         self.log.emit(f"  Video : {vc or '?'}" + (" + hvc1 tag" if vc == "hevc" else ""))
-        self.log.emit(f"  Audio : {ac or '?'}" + (" → AAC 256k" if ac not in APPLE_AUDIO else " (copy)"))
+        self.log.emit(f"  Audio : {ac or '?'}" + (" → AAC 256k" if need_reencode else " (copy)"))
         if drop_subs:
             self.log.emit("  Subs  : dropped (image-based subtitles can't go into MP4)")
 
