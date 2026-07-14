@@ -236,19 +236,21 @@ class ConvertWorker(QThread):
             s.get("codec_type") == "subtitle" and s.get("codec_name") not in TEXT_SUBS
             for s in strs
         )
-        return float(fmt.get("duration", 0)), video.get("codec_name"), audio.get("codec_name"), has_image_subs
+        channels = int(audio.get("channels", 2))
+        return float(fmt.get("duration", 0)), video.get("codec_name"), audio.get("codec_name"), has_image_subs, channels
 
     def run(self) -> None:
         try:
-            duration, vc, ac, has_image_subs = self._probe()
+            duration, vc, ac, has_image_subs, channels = self._probe()
         except Exception as e:
             self.log.emit(f"ERROR probing: {e}")
             self.finished.emit(False)
             return
 
-        ext       = os.path.splitext(self.item.src)[1].lower()
-        is_avi    = ext == ".avi"
-        drop_subs = is_avi or has_image_subs
+        ext        = os.path.splitext(self.item.src)[1].lower()
+        is_avi     = ext == ".avi"
+        drop_subs  = is_avi or has_image_subs
+        surround   = channels > 2
 
         # Re-encode video if it's not Apple-compatible (e.g. XVID/DivX MPEG-4 Part 2 from AVI)
         if vc in APPLE_VIDEO:
@@ -258,15 +260,16 @@ class ConvertWorker(QThread):
             video_args = ["-c:v", "libx264", "-crf", "18", "-preset", "fast"]
             video_note = " → H.264 (re-encode)"
 
-        # AVI MP3 uses a broken codec tag (0x0055) that doesn't survive remux to MP4 cleanly;
-        # always re-encode audio from AVI files.
-        need_audio_reencode = ac not in APPLE_AUDIO or is_avi
-        audio_args = ["-c:a", "aac", "-b:a", "256k"] if need_audio_reencode else ["-c:a", "copy"]
+        # Re-encode audio if: non-Apple codec, AVI source (broken MP3 tag), or surround (>2ch)
+        # Surround AAC is downmixed to stereo for iPhone/iPad compatibility.
+        need_audio_reencode = ac not in APPLE_AUDIO or is_avi or surround
+        audio_args = ["-c:a", "aac", "-b:a", "256k", "-ac", "2"] if need_audio_reencode else ["-c:a", "copy"]
         sub_args   = ["-sn"] if drop_subs else ["-c:s", "mov_text"]
 
         self.log.emit(f"▶ {os.path.basename(self.item.src)}")
         self.log.emit(f"  Video : {vc or '?'}{video_note}")
-        self.log.emit(f"  Audio : {ac or '?'}" + (" → AAC 256k" if need_audio_reencode else " (copy)"))
+        audio_note = f" → AAC stereo 256k ({channels}ch downmix)" if surround else (" → AAC 256k" if need_audio_reencode else " (copy)")
+        self.log.emit(f"  Audio : {ac or '?'}{audio_note}")
         if drop_subs:
             self.log.emit("  Subs  : dropped (image-based subtitles can't go into MP4)")
 
