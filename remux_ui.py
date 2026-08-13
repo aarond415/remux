@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-remux_ui.py — Drag-and-drop MKV / AVI → MP4 batch converter with optional TMDb tagging.
+remux_ui.py — Drag-and-drop MKV / AVI / MP4 batch converter with optional TMDb tagging.
 
 Requirements:
     pip install PyQt6
@@ -42,7 +42,7 @@ FFPROBE        = os.environ.get("FFPROBE_PATH", "ffprobe")
 SUBLER_DEFAULT = "/opt/homebrew/bin/SublerCLI"
 APPLE_VIDEO    = {"h264", "hevc", "prores", "mjpeg", "h263"}
 APPLE_AUDIO    = {"aac", "alac", "mp3", "ac3"}
-SUPPORTED      = {".mkv", ".avi"}
+SUPPORTED      = {".mkv", ".avi", ".mp4"}
 TMDB_BASE      = "https://api.themoviedb.org/3"
 TMDB_IMG       = "https://image.tmdb.org/t/p"
 
@@ -83,9 +83,16 @@ def notify(title: str, body: str) -> None:
 
 def default_dst(src: str, out_dir: Optional[str]) -> str:
     stem = os.path.splitext(src)[0]
+    ext  = os.path.splitext(src)[1].lower()
     if out_dir:
         stem = os.path.join(out_dir, os.path.basename(stem))
+    # MP4 inputs are re-encoded in place — output path is same as source
     return stem + ".mp4"
+
+
+def is_inplace(src: str) -> bool:
+    """True when the source is already an MP4 and will be overwritten."""
+    return os.path.splitext(src)[1].lower() == ".mp4"
 
 
 def tmdb_get(path: str, params: dict, key: str) -> dict:
@@ -273,7 +280,11 @@ class ConvertWorker(QThread):
         if drop_subs:
             self.log.emit("  Subs  : dropped (image-based subtitles can't go into MP4)")
 
-        cmd  = [FFMPEG, "-i", self.item.src] + video_args + audio_args + sub_args + ["-progress", "pipe:1", "-nostats", "-y", self.item.dst]
+        # MP4 inputs are overwritten in place via a temp file to avoid clobbering the source
+        inplace  = is_inplace(self.item.src)
+        out_path = self.item.dst + ".tmp.mp4" if inplace else self.item.dst
+
+        cmd  = [FFMPEG, "-i", self.item.src] + video_args + audio_args + sub_args + ["-progress", "pipe:1", "-nostats", "-y", out_path]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         dur_us = duration * 1_000_000
 
@@ -288,10 +299,13 @@ class ConvertWorker(QThread):
         proc.wait()
         if proc.returncode != 0:
             self.log.emit("  ERROR: ffmpeg failed.\n")
-            if os.path.exists(self.item.dst):
-                os.remove(self.item.dst)
+            if os.path.exists(out_path):
+                os.remove(out_path)
             self.finished.emit(False)
             return
+
+        if inplace:
+            os.replace(out_path, self.item.dst)
 
         self.log.emit(f"  → {os.path.basename(self.item.dst)}  ({os.path.getsize(self.item.dst)/1024**3:.2f} GB)")
         if self.delete_original:
@@ -679,7 +693,7 @@ class DropZone(QLabel):
     _HOVER = "border:2px dashed #4fc3f7;border-radius:12px;color:#4fc3f7;font-size:14px;background:#1a2a33;"
 
     def __init__(self):
-        super().__init__("Drop MKV / AVI files here — or click to browse")
+        super().__init__("Drop MKV, AVI, or MP4 files here — or click to browse")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumHeight(90)
         self.setStyleSheet(self._IDLE)
@@ -706,7 +720,7 @@ class DropZone(QLabel):
     def mousePressEvent(self, e):
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select video files", "",
-            "Video files (*.mkv *.avi);;All files (*)",
+            "Video files (*.mkv *.avi *.mp4);;All files (*)",
         )
         if paths: self.files_dropped.emit(paths)
 
