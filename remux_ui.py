@@ -95,6 +95,31 @@ def is_inplace(src: str) -> bool:
     return os.path.splitext(src)[1].lower() == ".mp4"
 
 
+def clean_filename(dst: str, tags: dict, media_type: str) -> str:
+    """Return a cleaned output path using TMDb title data."""
+    folder = os.path.dirname(dst)
+    fname  = os.path.basename(dst)
+    stem   = os.path.splitext(fname)[0]
+
+    if media_type == "tv":
+        m = re.search(r'[Ss](\d{1,2})[Ee](\d{1,2})', stem)
+        if m:
+            prefix    = stem[:m.end()]
+            ep_title  = tags.get("Name", "").strip()
+            # Sanitize title for filesystem
+            ep_title  = re.sub(r'[\\/:*?"<>|]', "", ep_title)
+            if ep_title:
+                return os.path.join(folder, f"{prefix} - {ep_title}.mp4")
+    else:
+        title = re.sub(r'[\\/:*?"<>|]', "", tags.get("Name", "").strip())
+        year  = (tags.get("Release Date", "") or "")[:4]
+        if title:
+            name = f"{title} ({year}).mp4" if year else f"{title}.mp4"
+            return os.path.join(folder, name)
+
+    return dst
+
+
 def tmdb_get(path: str, params: dict, key: str) -> dict:
     p = dict(params)
     p["api_key"] = key
@@ -891,8 +916,9 @@ class RemuxWindow(QMainWindow):
 
         # Options row
         opt_row = QHBoxLayout()
-        self.delete_chk = QCheckBox("Delete originals")
-        self.tag_chk    = QCheckBox("Tag with TMDb metadata")
+        self.delete_chk  = QCheckBox("Delete originals")
+        self.tag_chk     = QCheckBox("Tag with TMDb metadata")
+        self.rename_chk  = QCheckBox("Rename with episode title")
         self.media_combo = QComboBox()
         self.media_combo.addItems(["Movie", "TV Show"])
         self.media_combo.setFixedWidth(100)
@@ -906,6 +932,8 @@ class RemuxWindow(QMainWindow):
         opt_row.addWidget(self.delete_chk)
         opt_row.addSpacing(16)
         opt_row.addWidget(self.tag_chk)
+        opt_row.addSpacing(8)
+        opt_row.addWidget(self.rename_chk)
         opt_row.addSpacing(8)
         opt_row.addWidget(self.media_lbl)
         opt_row.addWidget(self.media_combo)
@@ -1123,10 +1151,11 @@ class RemuxWindow(QMainWindow):
             self._process_next()
             return
 
-        # Start tagging if enabled and configured
+        # Start TMDb fetch if tagging or renaming is enabled
         key    = SettingsDialog.tmdb_key()
         subler = SettingsDialog.subler_path()
-        if self.tag_chk.isChecked() and key and os.path.exists(subler):
+        want_fetch = (self.tag_chk.isChecked() or self.rename_chk.isChecked()) and key
+        if want_fetch:
             item.status = S_FETCHING
             self._set_status_cell(item.row, item.status)
             self.cur_lbl.setText("Fetching metadata…")
@@ -1136,8 +1165,8 @@ class RemuxWindow(QMainWindow):
             self._tag_workers.append(w)
             w.start()
         else:
-            if self.tag_chk.isChecked() and not key:
-                self._append_log("  ⚠ TMDb key not set — skipping tags. Add it in ⚙ Settings.")
+            if (self.tag_chk.isChecked() or self.rename_chk.isChecked()) and not key:
+                self._append_log("  ⚠ TMDb key not set — skipping. Add it in ⚙ Settings.")
             item.status = S_DONE
             self._set_status_cell(item.row, item.status)
             self._process_next()
@@ -1153,28 +1182,51 @@ class RemuxWindow(QMainWindow):
 
         self._append_log(f"  Matched: {match_title}")
         item.tmdb_tags = tags
-        item.status    = S_ARTWORK
-        self._set_status_cell(item.row, item.status)
+        media = "movie" if self.media_combo.currentIndex() == 0 else "tv"
 
-        media  = "movie" if self.media_combo.currentIndex() == 0 else "tv"
-        dlg    = ArtworkPickerDialog(self, item, tags, thumbs, match_title,
-                                     SettingsDialog.tmdb_key(), media)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            artwork_url = dlg.selected_url
-            tags        = dlg._tags   # may have been updated by re-search
+        # Rename file if requested
+        if self.rename_chk.isChecked():
+            new_dst = clean_filename(item.dst, tags, media)
+            if new_dst != item.dst:
+                try:
+                    os.rename(item.dst, new_dst)
+                    self._append_log(f"  Renamed → {os.path.basename(new_dst)}")
+                    item.dst = new_dst
+                    self.table.blockSignals(True)
+                    self.table.item(item.row, COL_OUTPUT).setText(os.path.basename(new_dst))
+                    self.table.item(item.row, COL_OUTPUT).setToolTip(new_dst)
+                    self.table.blockSignals(False)
+                except Exception as e:
+                    self._append_log(f"  ⚠ Rename failed: {e}")
+
+        # Tag if requested
+        subler = SettingsDialog.subler_path()
+        if self.tag_chk.isChecked() and os.path.exists(subler):
+            item.status = S_ARTWORK
+            self._set_status_cell(item.row, item.status)
+
+            dlg = ArtworkPickerDialog(self, item, tags, thumbs, match_title,
+                                      SettingsDialog.tmdb_key(), media)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                artwork_url = dlg.selected_url
+                tags        = dlg._tags
+            else:
+                artwork_url = None
+                self._append_log("  Artwork skipped.")
+
+            item.status = S_TAGGING
+            self._set_status_cell(item.row, item.status)
+            self.cur_lbl.setText("Writing tags…")
+
+            w = TagWriteWorker(item, tags, artwork_url, subler)
+            w.log.connect(self._append_log)
+            w.finished.connect(lambda ok, it=item: self._on_tag_done(it, ok))
+            self._tag_workers.append(w)
+            w.start()
         else:
-            artwork_url = None
-            self._append_log("  Artwork skipped.")
-
-        item.status = S_TAGGING
-        self._set_status_cell(item.row, item.status)
-        self.cur_lbl.setText("Writing tags…")
-
-        w = TagWriteWorker(item, tags, artwork_url, SettingsDialog.subler_path())
-        w.log.connect(self._append_log)
-        w.finished.connect(lambda ok, it=item: self._on_tag_done(it, ok))
-        self._tag_workers.append(w)
-        w.start()
+            item.status = S_DONE
+            self._set_status_cell(item.row, item.status)
+            self._process_next()
 
     def _on_tag_done(self, item: QueueItem, success: bool):
         item.status = S_DONE if success else S_ERROR
