@@ -95,6 +95,20 @@ def is_inplace(src: str) -> bool:
     return os.path.splitext(src)[1].lower() == ".mp4"
 
 
+def read_embedded_title(path: str) -> Optional[str]:
+    """Return the embedded title tag from an MP4, or None if absent."""
+    try:
+        r = subprocess.run(
+            [FFPROBE, "-v", "quiet", "-print_format", "json", "-show_format", path],
+            capture_output=True, text=True,
+        )
+        tags = json.loads(r.stdout).get("format", {}).get("tags", {})
+        # iTunes stores episode title as "title"; SublerCLI writes it there too
+        return (tags.get("title") or tags.get("Title") or "").strip() or None
+    except Exception:
+        return None
+
+
 def clean_filename(dst: str, tags: dict, media_type: str) -> str:
     """Return a cleaned output path using TMDb title data."""
     folder = os.path.dirname(dst)
@@ -1151,10 +1165,36 @@ class RemuxWindow(QMainWindow):
             self._process_next()
             return
 
-        # Start TMDb fetch if tagging or renaming is enabled
         key    = SettingsDialog.tmdb_key()
         subler = SettingsDialog.subler_path()
-        want_fetch = (self.tag_chk.isChecked() or self.rename_chk.isChecked()) and key
+        want_tag    = self.tag_chk.isChecked() and key and os.path.exists(subler)
+        want_rename = self.rename_chk.isChecked()
+
+        if want_rename and not want_tag:
+            # Try embedded metadata first — may avoid a TMDb round-trip entirely
+            embedded = read_embedded_title(item.dst)
+            if embedded:
+                self._append_log(f"  Using embedded title: {embedded}")
+                media   = "movie" if self.media_combo.currentIndex() == 0 else "tv"
+                new_dst = clean_filename(item.dst, {"Name": embedded}, media)
+                if new_dst != item.dst:
+                    try:
+                        os.rename(item.dst, new_dst)
+                        self._append_log(f"  Renamed → {os.path.basename(new_dst)}")
+                        item.dst = new_dst
+                        self.table.blockSignals(True)
+                        self.table.item(item.row, COL_OUTPUT).setText(os.path.basename(new_dst))
+                        self.table.item(item.row, COL_OUTPUT).setToolTip(new_dst)
+                        self.table.blockSignals(False)
+                    except Exception as e:
+                        self._append_log(f"  ⚠ Rename failed: {e}")
+                item.status = S_DONE
+                self._set_status_cell(item.row, item.status)
+                self._process_next()
+                return
+
+        # Fall back to TMDb fetch (needed for tagging, or rename with no embedded title)
+        want_fetch = (want_tag or want_rename) and key
         if want_fetch:
             item.status = S_FETCHING
             self._set_status_cell(item.row, item.status)
@@ -1165,7 +1205,7 @@ class RemuxWindow(QMainWindow):
             self._tag_workers.append(w)
             w.start()
         else:
-            if (self.tag_chk.isChecked() or self.rename_chk.isChecked()) and not key:
+            if (self.tag_chk.isChecked() or want_rename) and not key:
                 self._append_log("  ⚠ TMDb key not set — skipping. Add it in ⚙ Settings.")
             item.status = S_DONE
             self._set_status_cell(item.row, item.status)
