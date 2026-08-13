@@ -96,15 +96,24 @@ def is_inplace(src: str) -> bool:
 
 
 def read_embedded_title(path: str) -> Optional[str]:
-    """Return the embedded title tag from an MP4, or None if absent."""
+    """Return the embedded title tag from an MP4, or None if it's absent or looks like a filename."""
     try:
         r = subprocess.run(
             [FFPROBE, "-v", "quiet", "-print_format", "json", "-show_format", path],
             capture_output=True, text=True,
         )
-        tags = json.loads(r.stdout).get("format", {}).get("tags", {})
-        # iTunes stores episode title as "title"; SublerCLI writes it there too
-        return (tags.get("title") or tags.get("Title") or "").strip() or None
+        tags  = json.loads(r.stdout).get("format", {}).get("tags", {})
+        title = (tags.get("title") or tags.get("Title") or "").strip()
+        if not title:
+            return None
+        # Discard if it looks like a filename: contains SxxExx, lots of dots, or dashes+resolution
+        if re.search(r'[Ss]\d{1,2}[Ee]\d{1,2}', title):
+            return None
+        if title.count(".") >= 3:
+            return None
+        if re.search(r'\d{3,4}p', title):
+            return None
+        return title
     except Exception:
         return None
 
