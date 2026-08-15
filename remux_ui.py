@@ -941,7 +941,7 @@ class RemuxWindow(QMainWindow):
         opt_row = QHBoxLayout()
         self.delete_chk  = QCheckBox("Delete originals")
         self.tag_chk     = QCheckBox("Tag with TMDb metadata")
-        self.rename_chk  = QCheckBox("Rename with episode title")
+        self.rename_chk  = QCheckBox("Rename with TMDb title")
         self.media_combo = QComboBox()
         self.media_combo.addItems(["Movie", "TV Show"])
         self.media_combo.setFixedWidth(100)
@@ -1179,12 +1179,14 @@ class RemuxWindow(QMainWindow):
         want_tag    = self.tag_chk.isChecked() and key and os.path.exists(subler)
         want_rename = self.rename_chk.isChecked()
 
-        if want_rename and not want_tag:
-            # Try embedded metadata first — may avoid a TMDb round-trip entirely
+        media = "movie" if self.media_combo.currentIndex() == 0 else "tv"
+
+        if want_rename and not want_tag and media == "tv":
+            # For TV only: try embedded episode title to avoid a TMDb round-trip.
+            # Movies always fetch TMDb so we get the release year.
             embedded = read_embedded_title(item.dst)
             if embedded:
                 self._append_log(f"  Using embedded title: {embedded}")
-                media   = "movie" if self.media_combo.currentIndex() == 0 else "tv"
                 new_dst = clean_filename(item.dst, {"Name": embedded}, media)
                 if new_dst != item.dst:
                     try:
@@ -1208,7 +1210,6 @@ class RemuxWindow(QMainWindow):
             item.status = S_FETCHING
             self._set_status_cell(item.row, item.status)
             self.cur_lbl.setText("Fetching metadata…")
-            media = "movie" if self.media_combo.currentIndex() == 0 else "tv"
             w = TagFetchWorker(item, key, media)
             w.done.connect(self._on_fetch_done)
             self._tag_workers.append(w)
