@@ -517,6 +517,7 @@ class TagWriteWorker(QThread):
 
     def run(self) -> None:
         artwork_path = None
+        tmp_out      = self.item.dst + ".subler.mp4"
         try:
             if self.artwork_url:
                 tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -530,15 +531,18 @@ class TagWriteWorker(QThread):
                 all_tags["Artwork"] = artwork_path
 
             meta_str = "".join(f"{{{k}:{v}}}" for k, v in all_tags.items() if v)
-            result   = subprocess.run(
-                [self.subler, "-source", self.item.dst, "-dest", self.item.dst, "-metadata", meta_str],
+            # SublerCLI requires source != dest; write to a temp file then swap.
+            result = subprocess.run(
+                [self.subler, "-source", self.item.dst, "-dest", tmp_out, "-metadata", meta_str],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
-                self.log.emit(f"  ERROR (SublerCLI): {result.stderr.strip()[:200]}")
+                err = (result.stderr or result.stdout).strip()[:300]
+                self.log.emit(f"  ERROR (SublerCLI): {err}")
                 self.finished.emit(False)
                 return
 
+            os.replace(tmp_out, self.item.dst)
             self.log.emit("  Tags written successfully.\n")
             self.finished.emit(True)
         except Exception as e:
@@ -547,6 +551,8 @@ class TagWriteWorker(QThread):
         finally:
             if artwork_path and os.path.exists(artwork_path):
                 os.unlink(artwork_path)
+            if os.path.exists(tmp_out):
+                os.unlink(tmp_out)
 
 
 # ── Artwork picker ────────────────────────────────────────────────────────────
@@ -593,6 +599,7 @@ class ArtworkPickerDialog(QDialog):
         self._thumb_lbls: list[ThumbLabel] = []
         self.selected_url: Optional[str]   = thumbs[0][1] if thumbs else None
         self._fetch_worker: Optional[TagFetchWorker] = None
+        self.use_for_all: bool = False
         self._build_ui(tags, thumbs, match_title)
         self._apply_dark()
 
@@ -647,10 +654,14 @@ class ArtworkPickerDialog(QDialog):
         skip_btn = QPushButton("Skip tagging")
         skip_btn.setObjectName("small")
         skip_btn.clicked.connect(self.reject)
+        self._use_all_btn = QPushButton("Use for all remaining")
+        self._use_all_btn.setObjectName("all")
+        self._use_all_btn.clicked.connect(self._confirm_all)
         self._confirm_btn = QPushButton("Use selected image")
         self._confirm_btn.clicked.connect(self._confirm)
         btn_row.addWidget(skip_btn)
         btn_row.addStretch()
+        btn_row.addWidget(self._use_all_btn)
         btn_row.addWidget(self._confirm_btn)
         lay.addLayout(btn_row)
 
@@ -708,6 +719,11 @@ class ArtworkPickerDialog(QDialog):
         self._populate_grid(thumbs)
 
     def _confirm(self):
+        self.use_for_all = False
+        self.accept()
+
+    def _confirm_all(self):
+        self.use_for_all = True
         self.accept()
 
     def _apply_dark(self):
@@ -729,6 +745,11 @@ class ArtworkPickerDialog(QDialog):
                 font-weight:normal; padding:3px 10px; border-radius:5px;
             }
             QPushButton#small:hover { background:#383838; }
+            QPushButton#all {
+                background:#1a5c2a; font-size:13px;
+                font-weight:bold; padding:4px 14px; border-radius:6px;
+            }
+            QPushButton#all:hover { background:#237a39; }
         """)
 
 
@@ -876,6 +897,7 @@ class RemuxWindow(QMainWindow):
         self._probers:     list            = []
         self._tag_workers: list            = []
         self.worker:       Optional[ConvertWorker] = None
+        self._pinned_artwork: Optional[str] = None   # "Use for all" selection
         self._build_ui()
         self._apply_dark()
 
@@ -1137,6 +1159,7 @@ class RemuxWindow(QMainWindow):
     def _start_queue(self):
         self.convert_btn.setEnabled(False)
         self.open_btn.setVisible(False)
+        self._pinned_artwork = None   # reset per-batch pin
         self._process_next()
 
     def _process_next(self):
@@ -1255,14 +1278,22 @@ class RemuxWindow(QMainWindow):
             item.status = S_ARTWORK
             self._set_status_cell(item.row, item.status)
 
-            dlg = ArtworkPickerDialog(self, item, tags, thumbs, match_title,
-                                      SettingsDialog.tmdb_key(), media)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                artwork_url = dlg.selected_url
-                tags        = dlg._tags
+            if self._pinned_artwork is not None:
+                # User previously chose "Use for all" — skip the picker
+                artwork_url = self._pinned_artwork
+                self._append_log("  Using pinned artwork.")
             else:
-                artwork_url = None
-                self._append_log("  Artwork skipped.")
+                dlg = ArtworkPickerDialog(self, item, tags, thumbs, match_title,
+                                          SettingsDialog.tmdb_key(), media)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    artwork_url = dlg.selected_url
+                    tags        = dlg._tags
+                    if dlg.use_for_all:
+                        self._pinned_artwork = artwork_url
+                        self._append_log("  Artwork pinned for all remaining.")
+                else:
+                    artwork_url = None
+                    self._append_log("  Artwork skipped.")
 
             item.status = S_TAGGING
             self._set_status_cell(item.row, item.status)
