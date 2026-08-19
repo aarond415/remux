@@ -531,7 +531,7 @@ class TagWriteWorker(QThread):
 
             meta_str = "".join(f"{{{k}:{v}}}" for k, v in all_tags.items() if v)
             result   = subprocess.run(
-                [self.subler, "-dest", self.item.dst, "-metadata", meta_str],
+                [self.subler, "-source", self.item.dst, "-dest", self.item.dst, "-metadata", meta_str],
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
