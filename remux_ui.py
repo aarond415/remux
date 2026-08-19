@@ -526,11 +526,11 @@ class TagWriteWorker(QThread):
                 tmp.close()
                 artwork_path = tmp.name
 
-            all_tags = dict(self.tags)
-            if artwork_path:
-                all_tags["Artwork"] = artwork_path
+            # SublerCLI (1.5.1) ignores Artwork in -metadata; strip it out and
+            # use AtomicParsley separately for cover art.
+            text_tags = {k: v for k, v in self.tags.items() if k != "Artwork" and v}
+            meta_str  = "".join(f"{{{k}:{v}}}" for k, v in text_tags.items())
 
-            meta_str = "".join(f"{{{k}:{v}}}" for k, v in all_tags.items() if v)
             # SublerCLI requires source != dest; write to a temp file then swap.
             result = subprocess.run(
                 [self.subler, "-source", self.item.dst, "-dest", tmp_out, "-metadata", meta_str],
@@ -543,6 +543,22 @@ class TagWriteWorker(QThread):
                 return
 
             os.replace(tmp_out, self.item.dst)
+
+            # Embed artwork with AtomicParsley (SublerCLI silently ignores it)
+            if artwork_path:
+                ap = shutil.which("AtomicParsley")
+                if ap:
+                    r2 = subprocess.run(
+                        [ap, self.item.dst, "--artwork", artwork_path, "--overWrite"],
+                        capture_output=True, text=True,
+                    )
+                    if r2.returncode != 0:
+                        self.log.emit(f"  ⚠ Artwork write failed: {(r2.stderr or r2.stdout).strip()[:200]}")
+                    else:
+                        self.log.emit("  Artwork embedded.")
+                else:
+                    self.log.emit("  ⚠ AtomicParsley not found — artwork skipped. Install with: brew install atomicparsley")
+
             self.log.emit("  Tags written successfully.\n")
             self.finished.emit(True)
         except Exception as e:
