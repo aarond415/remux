@@ -778,7 +778,7 @@ class DropZone(QLabel):
     _HOVER = "border:2px dashed #4fc3f7;border-radius:12px;color:#4fc3f7;font-size:14px;background:#1a2a33;"
 
     def __init__(self):
-        super().__init__("Drop MKV, AVI, or MP4 files here — or click to browse")
+        super().__init__("Drop files or a folder here — left-click to browse files, right-click to browse folder")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumHeight(90)
         self.setStyleSheet(self._IDLE)
@@ -786,11 +786,21 @@ class DropZone(QLabel):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def _valid(self, mime: QMimeData) -> list:
-        return [u.toLocalFile() for u in mime.urls()
-                if os.path.splitext(u.toLocalFile())[1].lower() in SUPPORTED]
+        paths = []
+        for u in mime.urls():
+            p = u.toLocalFile()
+            if os.path.isdir(p):
+                for f in sorted(os.listdir(p)):
+                    if os.path.splitext(f)[1].lower() in SUPPORTED:
+                        paths.append(os.path.join(p, f))
+            elif os.path.splitext(p)[1].lower() in SUPPORTED:
+                paths.append(p)
+        return paths
 
     def dragEnterEvent(self, e: QDragEnterEvent):
-        if self._valid(e.mimeData()):
+        urls = e.mimeData().urls()
+        has_dir = any(os.path.isdir(u.toLocalFile()) for u in urls)
+        if self._valid(e.mimeData()) or has_dir:
             e.acceptProposedAction(); self.setStyleSheet(self._HOVER)
         else:
             e.ignore()
@@ -803,11 +813,22 @@ class DropZone(QLabel):
         if paths: self.files_dropped.emit(paths)
 
     def mousePressEvent(self, e):
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select video files", "",
-            "Video files (*.mkv *.avi *.mp4);;All files (*)",
-        )
-        if paths: self.files_dropped.emit(paths)
+        # Right-click → pick a folder; left-click → pick files
+        if e.button() == Qt.MouseButton.RightButton:
+            folder = QFileDialog.getExistingDirectory(self, "Select folder")
+            if folder:
+                paths = sorted(
+                    os.path.join(folder, f) for f in os.listdir(folder)
+                    if os.path.splitext(f)[1].lower() in SUPPORTED
+                )
+                if paths:
+                    self.files_dropped.emit(paths)
+        else:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Select video files", "",
+                "Video files (*.mkv *.avi *.mp4);;All files (*)",
+            )
+            if paths: self.files_dropped.emit(paths)
 
 
 # ── Settings dialog ───────────────────────────────────────────────────────────
