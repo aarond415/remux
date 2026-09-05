@@ -936,6 +936,7 @@ class RemuxWindow(QMainWindow):
         self._tag_workers: list            = []
         self.worker:       Optional[ConvertWorker] = None
         self._pinned_artwork: Optional[str] = None   # "Use for all" selection
+        self._tag_only_mode:  bool          = False
         self._build_ui()
         self._apply_dark()
 
@@ -1007,6 +1008,12 @@ class RemuxWindow(QMainWindow):
         self.media_combo.setFixedWidth(100)
         self.media_lbl = QLabel("Type:")
         self.media_lbl.setStyleSheet("color:#aaa;font-size:12px;")
+        self.tag_only_btn = QPushButton("Tag & Rename Only")
+        self.tag_only_btn.setEnabled(False)
+        self.tag_only_btn.setFixedHeight(36)
+        self.tag_only_btn.setMinimumWidth(140)
+        self.tag_only_btn.setObjectName("tagonly")
+        self.tag_only_btn.clicked.connect(self._start_tag_only)
         self.convert_btn = QPushButton("Convert All")
         self.convert_btn.setEnabled(False)
         self.convert_btn.setFixedHeight(36)
@@ -1021,6 +1028,8 @@ class RemuxWindow(QMainWindow):
         opt_row.addWidget(self.media_lbl)
         opt_row.addWidget(self.media_combo)
         opt_row.addStretch()
+        opt_row.addWidget(self.tag_only_btn)
+        opt_row.addSpacing(8)
         opt_row.addWidget(self.convert_btn)
         lay.addLayout(opt_row)
 
@@ -1064,6 +1073,12 @@ class RemuxWindow(QMainWindow):
                 font-weight:normal; padding:3px 10px; border-radius:5px;
             }
             QPushButton#small:hover { background:#383838; }
+            QPushButton#tagonly {
+                background:#1a4a6e; border:none; border-radius:6px;
+                color:white; font-size:13px; font-weight:bold; padding:4px 14px;
+            }
+            QPushButton#tagonly:hover    { background:#2561a0; }
+            QPushButton#tagonly:disabled { background:#2a2a2a; color:#555; }
             QProgressBar {
                 background:#2a2a2a; border:1px solid #444; border-radius:4px;
                 text-align:center; color:#ccc; font-size:10px;
@@ -1105,6 +1120,7 @@ class RemuxWindow(QMainWindow):
             w.start()
         self._refresh_header()
         self.convert_btn.setEnabled(True)
+        self.tag_only_btn.setEnabled(True)
 
     def _insert_row(self, item: QueueItem):
         r = self.table.rowCount()
@@ -1178,7 +1194,9 @@ class RemuxWindow(QMainWindow):
                 self.queue.pop(row); self.table.removeRow(row)
         for i, item in enumerate(self.queue): item.row = i
         self._refresh_header()
-        if not self.queue: self.convert_btn.setEnabled(False)
+        if not self.queue:
+            self.convert_btn.setEnabled(False)
+            self.tag_only_btn.setEnabled(False)
 
     def _clear_done(self):
         for row in range(len(self.queue) - 1, -1, -1):
@@ -1186,7 +1204,9 @@ class RemuxWindow(QMainWindow):
                 self.queue.pop(row); self.table.removeRow(row)
         for i, item in enumerate(self.queue): item.row = i
         self._refresh_header()
-        if not self.queue: self.convert_btn.setEnabled(False)
+        if not self.queue:
+            self.convert_btn.setEnabled(False)
+            self.tag_only_btn.setEnabled(False)
 
     def _refresh_header(self):
         n = len(self.queue)
@@ -1196,14 +1216,30 @@ class RemuxWindow(QMainWindow):
 
     def _start_queue(self):
         self.convert_btn.setEnabled(False)
+        self.tag_only_btn.setEnabled(False)
         self.open_btn.setVisible(False)
-        self._pinned_artwork = None   # reset per-batch pin
+        self._pinned_artwork = None
+        self._tag_only_mode  = False
+        self._process_next()
+
+    def _start_tag_only(self):
+        """Skip conversion — jump straight to tag/rename for all queued files."""
+        self.convert_btn.setEnabled(False)
+        self.tag_only_btn.setEnabled(False)
+        self.open_btn.setVisible(False)
+        self._pinned_artwork = None
+        self._tag_only_mode = True
         self._process_next()
 
     def _process_next(self):
         for item in self.queue:
             if item.status == S_PENDING:
-                self._convert(item)
+                if self._tag_only_mode:
+                    item.dst = item.src   # tag the file in place
+                    self._append_log(f"▶ {os.path.basename(item.src)}  [tag/rename only]")
+                    self._on_convert_done(True, item)
+                else:
+                    self._convert(item)
                 return
         # All done
         self.cur_lbl.setText(""); self.progress.setValue(0)
@@ -1213,7 +1249,9 @@ class RemuxWindow(QMainWindow):
         if done:
             self.open_btn.setVisible(True)
             notify("Remux", f"Batch complete — {done}/{total} file{'s' if done != 1 else ''} converted.")
-        self.convert_btn.setEnabled(any(i.status == S_PENDING for i in self.queue))
+        has_pending = any(i.status == S_PENDING for i in self.queue)
+        self.convert_btn.setEnabled(has_pending)
+        self.tag_only_btn.setEnabled(has_pending)
 
     def _convert(self, item: QueueItem):
         item.status = S_CONVERTING
