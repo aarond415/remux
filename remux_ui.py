@@ -354,9 +354,10 @@ class ConvertWorker(QThread):
 
         if inplace:
             os.replace(out_path, self.item.dst)
+            # Original is already gone — the swap above replaced it.
 
         self.log.emit(f"  → {os.path.basename(self.item.dst)}  ({os.path.getsize(self.item.dst)/1024**3:.2f} GB)")
-        if self.delete_original:
+        if self.delete_original and not inplace:
             os.remove(self.item.src)
             self.log.emit("  Deleted original.")
         self.log.emit("")
