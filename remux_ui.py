@@ -332,7 +332,9 @@ class ConvertWorker(QThread):
         inplace  = is_inplace(self.item.src)
         out_path = self.item.dst + ".tmp.mp4" if inplace else self.item.dst
 
-        cmd  = [FFMPEG, "-i", self.item.src] + video_args + audio_args + sub_args + ["-progress", "pipe:1", "-nostats", "-y", out_path]
+        # -movflags +faststart puts moov at the front so SublerCLI never has to relocate it
+        # (SublerCLI 1.5.1 has a bug where relocating moov shifts stco offsets by +276 bytes)
+        cmd  = [FFMPEG, "-i", self.item.src] + video_args + audio_args + sub_args + ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-y", out_path]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         dur_us = duration * 1_000_000
 
