@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFormLayout, QGridLayout,
     QHeaderView, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QScrollArea, QTableWidget, QTableWidgetItem,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QTableWidget, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -584,15 +584,21 @@ class ThumbLabel(QLabel):
 
     def __init__(self, idx: int, pixmap: QPixmap, url: str):
         super().__init__()
-        self.idx = idx
-        self.url = url
-        self.setFixedSize(92, 138)
+        self.idx     = idx
+        self.url     = url
+        self._pixmap = pixmap
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet(self._NORMAL)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        if not pixmap.isNull():
-            self.setPixmap(pixmap.scaled(88, 134, Qt.AspectRatioMode.KeepAspectRatio,
-                                          Qt.TransformationMode.SmoothTransformation))
+        self.resize_thumb(120)
+
+    def resize_thumb(self, w: int):
+        h = int(w * 1.5)
+        self.setFixedSize(w, h)
+        if not self._pixmap.isNull():
+            self.setPixmap(self._pixmap.scaled(w - 4, h - 4,
+                                               Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
         else:
             self.setText("?")
 
@@ -652,6 +658,23 @@ class ArtworkPickerDialog(QDialog):
             sub_lbl.setStyleSheet("color:#777;font-size:11px;")
             lay.addWidget(sub_lbl)
 
+        # Size slider
+        self._thumb_w = 120
+        size_row = QHBoxLayout()
+        size_lbl = QLabel("Size:")
+        size_lbl.setStyleSheet("color:#888;font-size:11px;")
+        size_lbl.setFixedWidth(32)
+        self._size_slider = QSlider(Qt.Orientation.Horizontal)
+        self._size_slider.setRange(80, 200)
+        self._size_slider.setValue(self._thumb_w)
+        self._size_slider.setFixedWidth(140)
+        self._size_slider.setTickInterval(40)
+        self._size_slider.valueChanged.connect(self._on_size_changed)
+        size_row.addWidget(size_lbl)
+        size_row.addWidget(self._size_slider)
+        size_row.addStretch()
+        lay.addLayout(size_row)
+
         # Thumbnail grid in scroll area
         self._scroll_widget = QWidget()
         self._grid = QGridLayout(self._scroll_widget)
@@ -686,6 +709,14 @@ class ArtworkPickerDialog(QDialog):
 
         self._populate_grid(thumbs)
 
+    def _on_size_changed(self, w: int):
+        self._thumb_w = w
+        cols = max(2, 560 // (w + 8))
+        for lbl in self._thumb_lbls:
+            lbl.resize_thumb(w)
+        for i, lbl in enumerate(self._thumb_lbls):
+            self._grid.addWidget(lbl, i // cols, i % cols)
+
     def _populate_grid(self, thumbs: list):
         # Clear existing
         for lbl in self._thumb_lbls:
@@ -701,11 +732,12 @@ class ArtworkPickerDialog(QDialog):
 
         self._confirm_btn.setEnabled(True)
         self.selected_url = thumbs[0][1]
+        cols = max(2, 560 // (self._thumb_w + 8))
 
         for i, (px, url) in enumerate(thumbs):
             lbl = ThumbLabel(i, px, url)
             lbl.clicked.connect(self._select)
-            self._grid.addWidget(lbl, i // 4, i % 4)
+            self._grid.addWidget(lbl, i // cols, i % cols)
             self._thumb_lbls.append(lbl)
 
         if self._thumb_lbls:
