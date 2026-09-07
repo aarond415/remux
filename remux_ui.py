@@ -163,7 +163,7 @@ def parse_movie_title(filename: str):
 def parse_tv_filename(filename: str):
     """Return (show_title, year, season, episode) from a TV episode filename."""
     stem = os.path.splitext(filename)[0]
-    m_ep = re.search(r"[Ss](\d{1,2})[Ee](\d{1,2})", stem)
+    m_ep = re.search(r"[Ss](\d{1,2})\.?[Ee](\d{1,2})", stem)
     if not m_ep:
         return None, None, None, None
     season  = int(m_ep.group(1))
