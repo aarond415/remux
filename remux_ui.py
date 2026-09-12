@@ -547,20 +547,33 @@ class TagWriteWorker(QThread):
 
             os.replace(tmp_out, self.item.dst)
 
-            # Embed artwork with AtomicParsley (SublerCLI silently ignores it)
+            # Embed artwork via ffmpeg (-c copy + -movflags +faststart) so the
+            # container is fully rebuilt with correct stco offsets.
+            # AtomicParsley was previously used here but it inserts free-atom
+            # padding into mdat without updating stco, corrupting playback.
             if artwork_path:
-                ap = shutil.which("AtomicParsley")
-                if ap:
+                ffmpeg = shutil.which("ffmpeg")
+                if ffmpeg:
+                    tmp_art = self.item.dst + ".artwork.mp4"
                     r2 = subprocess.run(
-                        [ap, self.item.dst, "--artwork", artwork_path, "--overWrite"],
+                        [ffmpeg, "-y", "-loglevel", "error",
+                         "-i", self.item.dst, "-i", artwork_path,
+                         "-c", "copy",
+                         "-map", "0", "-map", "1",
+                         "-disposition:v:1", "attached_pic",
+                         "-movflags", "+faststart",
+                         tmp_art],
                         capture_output=True, text=True,
                     )
                     if r2.returncode != 0:
                         self.log.emit(f"  ⚠ Artwork write failed: {(r2.stderr or r2.stdout).strip()[:200]}")
+                        if os.path.exists(tmp_art):
+                            os.unlink(tmp_art)
                     else:
+                        os.replace(tmp_art, self.item.dst)
                         self.log.emit("  Artwork embedded.")
                 else:
-                    self.log.emit("  ⚠ AtomicParsley not found — artwork skipped. Install with: brew install atomicparsley")
+                    self.log.emit("  ⚠ ffmpeg not found — artwork skipped.")
 
             self.log.emit("  Tags written successfully.\n")
             self.finished.emit(True)
