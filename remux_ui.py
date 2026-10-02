@@ -18,8 +18,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QMimeData, QPoint, QSettings, QThread, pyqtSignal
@@ -53,6 +55,7 @@ S_ARTWORK    = "🎨  Pick artwork"
 S_TAGGING    = "🏷   Tagging…"
 S_DONE       = "✅  Done"
 S_ERROR      = "❌  Error"
+S_SKIPPED    = "⏭  Skipped"
 
 STATUS_COLOR = {
     S_PENDING:    "#888",
@@ -62,6 +65,7 @@ STATUS_COLOR = {
     S_TAGGING:    "#4fc3f7",
     S_DONE:       "#81c784",
     S_ERROR:      "#e57373",
+    S_SKIPPED:    "#aaa",
 }
 
 COL_INPUT  = 0
@@ -227,12 +231,13 @@ def make_icon(size: int = 256) -> QIcon:
 
 class QueueItem:
     def __init__(self, src: str, out_dir: Optional[str] = None):
-        self.src       = src
-        self.dst       = default_dst(src, out_dir)
-        self.status    = S_PENDING
-        self.info      = ""
-        self.row       = -1
+        self.src        = src
+        self.dst        = default_dst(src, out_dir)
+        self.status     = S_PENDING
+        self.info       = ""
+        self.row        = -1
         self.tmdb_tags: dict = {}
+        self.start_time: Optional[float] = None
 
 
 # ── Workers ───────────────────────────────────────────────────────────────────
@@ -274,6 +279,11 @@ class ConvertWorker(QThread):
         super().__init__()
         self.item            = item
         self.delete_original = delete_original
+        self._proc: Optional[subprocess.Popen] = None
+
+    def kill(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
 
     def _probe(self):
         r = subprocess.run(
@@ -335,10 +345,10 @@ class ConvertWorker(QThread):
         # -movflags +faststart puts moov at the front so SublerCLI never has to relocate it
         # (SublerCLI 1.5.1 has a bug where relocating moov shifts stco offsets by +276 bytes)
         cmd  = [FFMPEG, "-i", self.item.src] + video_args + audio_args + sub_args + ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-y", out_path]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         dur_us = duration * 1_000_000
 
-        for line in proc.stdout:
+        for line in self._proc.stdout:
             line = line.strip()
             m = re.match(r"out_time_us=(\d+)", line)
             if m and dur_us > 0:
@@ -346,8 +356,8 @@ class ConvertWorker(QThread):
             elif line == "progress=end":
                 self.progress.emit(100)
 
-        proc.wait()
-        if proc.returncode != 0:
+        self._proc.wait()
+        if self._proc.returncode != 0:
             self.log.emit("  ERROR: ffmpeg failed.\n")
             if os.path.exists(out_path):
                 os.remove(out_path)
@@ -517,6 +527,16 @@ class TagWriteWorker(QThread):
         self.tags        = tags
         self.artwork_url = artwork_url
         self.subler      = subler
+        self._proc: Optional[subprocess.Popen] = None
+
+    def kill(self):
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+
+    def _run_proc(self, cmd: list) -> subprocess.CompletedProcess:
+        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = self._proc.communicate()
+        return subprocess.CompletedProcess(cmd, self._proc.returncode, stdout, stderr)
 
     def run(self) -> None:
         artwork_path = None
@@ -530,14 +550,13 @@ class TagWriteWorker(QThread):
                 artwork_path = tmp.name
 
             # SublerCLI (1.5.1) ignores Artwork in -metadata; strip it out and
-            # use AtomicParsley separately for cover art.
+            # use ffmpeg separately for cover art.
             text_tags = {k: v for k, v in self.tags.items() if k != "Artwork" and v}
             meta_str  = "".join(f"{{{k}:{v}}}" for k, v in text_tags.items())
 
             # SublerCLI requires source != dest; write to a temp file then swap.
-            result = subprocess.run(
-                [self.subler, "-source", self.item.dst, "-dest", tmp_out, "-metadata", meta_str],
-                capture_output=True, text=True,
+            result = self._run_proc(
+                [self.subler, "-source", self.item.dst, "-dest", tmp_out, "-metadata", meta_str]
             )
             if result.returncode != 0:
                 err = (result.stderr or result.stdout).strip()[:300]
@@ -555,15 +574,14 @@ class TagWriteWorker(QThread):
                 ffmpeg = shutil.which("ffmpeg")
                 if ffmpeg:
                     tmp_art = self.item.dst + ".artwork.mp4"
-                    r2 = subprocess.run(
+                    r2 = self._run_proc(
                         [ffmpeg, "-y", "-loglevel", "error",
                          "-i", self.item.dst, "-i", artwork_path,
                          "-c", "copy",
                          "-map", "0", "-map", "1",
                          "-disposition:v:1", "attached_pic",
                          "-movflags", "+faststart",
-                         tmp_art],
-                        capture_output=True, text=True,
+                         tmp_art]
                     )
                     if r2.returncode != 0:
                         self.log.emit(f"  ⚠ Artwork write failed: {(r2.stderr or r2.stdout).strip()[:200]}")
@@ -982,8 +1000,12 @@ class RemuxWindow(QMainWindow):
         self._probers:     list            = []
         self._tag_workers: list            = []
         self.worker:       Optional[ConvertWorker] = None
+        self._tag_worker:  Optional[TagWriteWorker] = None
         self._pinned_artwork: Optional[str] = None   # "Use for all" selection
         self._tag_only_mode:  bool          = False
+        self._stop_after:     bool          = False  # finish current job then halt
+        self._skip_requested: bool          = False  # kill current job and move on
+        self._queue_running:  bool          = False
         self._build_ui()
         self._apply_dark()
 
@@ -1088,7 +1110,25 @@ class RemuxWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100); self.progress.setValue(0)
         self.progress.setFixedHeight(16)
-        prog_row.addWidget(self.cur_lbl, 1); prog_row.addWidget(self.progress, 2)
+
+        self.skip_btn       = QPushButton("⏭  Skip")
+        self.stop_after_btn = QPushButton("⏸  Stop After This")
+        self.stop_now_btn   = QPushButton("⏹  Stop Now")
+        self.skip_btn.setObjectName("skip")
+        self.stop_after_btn.setObjectName("stopafter")
+        self.stop_now_btn.setObjectName("stopnow")
+        for btn in (self.skip_btn, self.stop_after_btn, self.stop_now_btn):
+            btn.setVisible(False)
+        self.skip_btn.clicked.connect(self._skip_current)
+        self.stop_after_btn.clicked.connect(self._stop_after_current)
+        self.stop_now_btn.clicked.connect(self._stop_now)
+
+        prog_row.addWidget(self.cur_lbl, 1)
+        prog_row.addWidget(self.progress, 2)
+        prog_row.addSpacing(8)
+        prog_row.addWidget(self.skip_btn)
+        prog_row.addWidget(self.stop_after_btn)
+        prog_row.addWidget(self.stop_now_btn)
         lay.addLayout(prog_row)
 
         # Log
@@ -1126,6 +1166,22 @@ class RemuxWindow(QMainWindow):
             }
             QPushButton#tagonly:hover    { background:#2561a0; }
             QPushButton#tagonly:disabled { background:#2a2a2a; color:#555; }
+            QPushButton#skip {
+                background:#7a4500; font-size:11px;
+                font-weight:normal; padding:3px 10px; border-radius:5px;
+            }
+            QPushButton#skip:hover { background:#a85e00; }
+            QPushButton#stopafter {
+                background:#3a3a1a; font-size:11px;
+                font-weight:normal; padding:3px 10px; border-radius:5px;
+            }
+            QPushButton#stopafter:hover    { background:#5a5a28; }
+            QPushButton#stopafter:disabled { background:#2a2a2a; color:#555; }
+            QPushButton#stopnow {
+                background:#5a1a1a; font-size:11px;
+                font-weight:normal; padding:3px 10px; border-radius:5px;
+            }
+            QPushButton#stopnow:hover { background:#8a2a2a; }
             QProgressBar {
                 background:#2a2a2a; border:1px solid #444; border-radius:4px;
                 text-align:center; color:#ccc; font-size:10px;
@@ -1247,7 +1303,7 @@ class RemuxWindow(QMainWindow):
 
     def _clear_done(self):
         for row in range(len(self.queue) - 1, -1, -1):
-            if self.queue[row].status in (S_DONE, S_ERROR):
+            if self.queue[row].status in (S_DONE, S_ERROR, S_SKIPPED):
                 self.queue.pop(row); self.table.removeRow(row)
         for i, item in enumerate(self.queue): item.row = i
         self._refresh_header()
@@ -1261,12 +1317,20 @@ class RemuxWindow(QMainWindow):
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
 
+    def _set_queue_running(self, running: bool):
+        self._queue_running = running
+        for btn in (self.skip_btn, self.stop_after_btn, self.stop_now_btn):
+            btn.setVisible(running)
+
     def _start_queue(self):
         self.convert_btn.setEnabled(False)
         self.tag_only_btn.setEnabled(False)
         self.open_btn.setVisible(False)
-        self._pinned_artwork = None
-        self._tag_only_mode  = False
+        self._pinned_artwork  = None
+        self._tag_only_mode   = False
+        self._stop_after      = False
+        self._skip_requested  = False
+        self._set_queue_running(True)
         self._process_next()
 
     def _start_tag_only(self):
@@ -1274,21 +1338,58 @@ class RemuxWindow(QMainWindow):
         self.convert_btn.setEnabled(False)
         self.tag_only_btn.setEnabled(False)
         self.open_btn.setVisible(False)
-        self._pinned_artwork = None
-        self._tag_only_mode = True
+        self._pinned_artwork  = None
+        self._tag_only_mode   = True
+        self._stop_after      = False
+        self._skip_requested  = False
+        self._set_queue_running(True)
         self._process_next()
 
+    def _skip_current(self):
+        self._skip_requested = True
+        if self.worker:
+            self.worker.kill()
+        if self._tag_worker:
+            self._tag_worker.kill()
+
+    def _stop_after_current(self):
+        self._stop_after = True
+        self.stop_after_btn.setEnabled(False)
+
+    def _stop_now(self):
+        self._stop_after     = True
+        self._skip_requested = True
+        if self.worker:
+            self.worker.kill()
+        if self._tag_worker:
+            self._tag_worker.kill()
+
     def _process_next(self):
+        if self._stop_after:
+            self._stop_after     = False
+            self._skip_requested = False
+            self._set_queue_running(False)
+            self.cur_lbl.setText("Queue paused.")
+            self.progress.setValue(0)
+            has_pending = any(i.status == S_PENDING for i in self.queue)
+            self.convert_btn.setEnabled(has_pending)
+            self.tag_only_btn.setEnabled(has_pending)
+            self.stop_after_btn.setEnabled(True)
+            return
+
         for item in self.queue:
             if item.status == S_PENDING:
+                self._skip_requested = False
                 if self._tag_only_mode:
                     item.dst = item.src   # tag the file in place
+                    self._start_job(item)
                     self._append_log(f"▶ {os.path.basename(item.src)}  [tag/rename only]")
                     self._on_convert_done(True, item)
                 else:
                     self._convert(item)
                 return
         # All done
+        self._set_queue_running(False)
         self.cur_lbl.setText(""); self.progress.setValue(0)
         done  = sum(1 for i in self.queue if i.status == S_DONE)
         total = len(self.queue)
@@ -1300,7 +1401,29 @@ class RemuxWindow(QMainWindow):
         self.convert_btn.setEnabled(has_pending)
         self.tag_only_btn.setEnabled(has_pending)
 
+    def _start_job(self, item: QueueItem):
+        item.start_time = time.time()
+        ts = datetime.now().strftime("%H:%M:%S")
+        self._append_log(f"[{ts}] Starting {os.path.basename(item.src)}")
+
+    def _finish_item(self, item: QueueItem, success: bool, skipped: bool = False):
+        elapsed = time.time() - (item.start_time or time.time())
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+        ts = datetime.now().strftime("%H:%M:%S")
+        if skipped:
+            item.status = S_SKIPPED
+            self._append_log(f"[{ts}] ⏭ Skipped  ({elapsed_str})\n")
+        elif success:
+            item.status = S_DONE
+            self._append_log(f"[{ts}] ✓ Done  ({elapsed_str})\n")
+        else:
+            item.status = S_ERROR
+            self._append_log(f"[{ts}] ✗ Failed  ({elapsed_str})\n")
+        self._set_status_cell(item.row, item.status)
+
     def _convert(self, item: QueueItem):
+        self._start_job(item)
         item.status = S_CONVERTING
         self._set_status_cell(item.row, item.status)
         self.table.scrollToItem(self.table.item(item.row, 0))
@@ -1314,9 +1437,13 @@ class RemuxWindow(QMainWindow):
         self.worker.start()
 
     def _on_convert_done(self, success: bool, item: QueueItem):
+        if self._skip_requested:
+            self._finish_item(item, success=False, skipped=True)
+            self._process_next()
+            return
+
         if not success:
-            item.status = S_ERROR
-            self._set_status_cell(item.row, item.status)
+            self._finish_item(item, success=False)
             self._process_next()
             return
 
@@ -1345,10 +1472,9 @@ class RemuxWindow(QMainWindow):
                         self.table.blockSignals(False)
                     except Exception as e:
                         self._append_log(f"  ⚠ Rename failed: {e}")
-                item.status = S_DONE
-                self._set_status_cell(item.row, item.status)
-                self._process_next()
-                return
+            self._finish_item(item, success=True)
+            self._process_next()
+            return
 
         # Fall back to TMDb fetch (needed for tagging, or rename with no embedded title)
         want_fetch = (want_tag or want_rename) and key
@@ -1363,16 +1489,14 @@ class RemuxWindow(QMainWindow):
         else:
             if (self.tag_chk.isChecked() or want_rename) and not key:
                 self._append_log("  ⚠ TMDb key not set — skipping. Add it in ⚙ Settings.")
-            item.status = S_DONE
-            self._set_status_cell(item.row, item.status)
+            self._finish_item(item, success=True)
             self._process_next()
 
     def _on_fetch_done(self, item: QueueItem, tags: dict, thumbs: list,
                        match_title: str, error: str):
         if error or not tags:
             self._append_log(f"  TMDb: {error or 'no match'} — skipping tags.")
-            item.status = S_DONE
-            self._set_status_cell(item.row, item.status)
+            self._finish_item(item, success=True)
             self._process_next()
             return
 
@@ -1426,15 +1550,16 @@ class RemuxWindow(QMainWindow):
             w.log.connect(self._append_log)
             w.finished.connect(lambda ok, it=item: self._on_tag_done(it, ok))
             self._tag_workers.append(w)
+            self._tag_worker = w
             w.start()
         else:
-            item.status = S_DONE
-            self._set_status_cell(item.row, item.status)
+            self._finish_item(item, success=True)
             self._process_next()
 
     def _on_tag_done(self, item: QueueItem, success: bool):
-        item.status = S_DONE if success else S_ERROR
-        self._set_status_cell(item.row, item.status)
+        self._tag_worker = None
+        skipped = self._skip_requested
+        self._finish_item(item, success=success, skipped=skipped)
         self._process_next()
 
     # ── Output folder ─────────────────────────────────────────────────────────
