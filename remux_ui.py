@@ -516,8 +516,27 @@ class TagFetchWorker(QThread):
             self.done.emit(self.item, {}, [], "", str(e))
 
 
+# SublerCLI field names → ffmpeg -metadata keys (iTunes/MP4 atoms)
+_SUBLER_TO_FFMPEG = {
+    "Name":          "title",
+    "Artist":        "artist",
+    "Album":         "album",
+    "Genre":         "genre",
+    "Release Date":  "date",
+    "Description":   "description",
+    "TV Show":       "show",
+    "TV Season":     "season_number",
+    "TV Episode #":  "episode_sort",
+    "TV Episode ID": "episode_id",
+    "TV Network":    "network",
+    "HD Video":      "hd_video",
+}
+# SublerCLI "Media Kind" values → iTunes stik atom values for ffmpeg
+_MEDIA_KIND = {"Movie": "9", "9": "9", "10": "10"}
+
+
 class TagWriteWorker(QThread):
-    """Downloads selected artwork and writes tags via SublerCLI."""
+    """Downloads artwork and writes tags+artwork in a single ffmpeg pass."""
     log      = pyqtSignal(str)
     finished = pyqtSignal(bool)
 
@@ -526,21 +545,16 @@ class TagWriteWorker(QThread):
         self.item        = item
         self.tags        = tags
         self.artwork_url = artwork_url
-        self.subler      = subler
+        self.subler      = subler   # kept for API compatibility; no longer used
         self._proc: Optional[subprocess.Popen] = None
 
     def kill(self):
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
 
-    def _run_proc(self, cmd: list) -> subprocess.CompletedProcess:
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        stdout, stderr = self._proc.communicate()
-        return subprocess.CompletedProcess(cmd, self._proc.returncode, stdout, stderr)
-
     def run(self) -> None:
         artwork_path = None
-        tmp_out      = self.item.dst + ".subler.mp4"
+        tmp_out      = self.item.dst + ".tag.mp4"
         try:
             if self.artwork_url:
                 tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -549,50 +563,36 @@ class TagWriteWorker(QThread):
                 tmp.close()
                 artwork_path = tmp.name
 
-            # SublerCLI (1.5.1) ignores Artwork in -metadata; strip it out and
-            # use ffmpeg separately for cover art.
-            text_tags = {k: v for k, v in self.tags.items() if k != "Artwork" and v}
-            meta_str  = "".join(f"{{{k}:{v}}}" for k, v in text_tags.items())
+            # Build a single ffmpeg -c copy pass that writes tags and artwork
+            # together — one file read+write instead of the previous two-pass
+            # SublerCLI → ffmpeg pipeline.
+            cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", self.item.dst]
+            if artwork_path:
+                cmd += ["-i", artwork_path]
 
-            # SublerCLI requires source != dest; write to a temp file then swap.
-            result = self._run_proc(
-                [self.subler, "-source", self.item.dst, "-dest", tmp_out, "-metadata", meta_str]
-            )
-            if result.returncode != 0:
-                err = (result.stderr or result.stdout).strip()[:300]
-                self.log.emit(f"  ERROR (SublerCLI): {err}")
+            cmd += ["-c", "copy", "-map", "0"]
+            if artwork_path:
+                cmd += ["-map", "1", "-disposition:v:1", "attached_pic"]
+
+            for subler_key, ff_key in _SUBLER_TO_FFMPEG.items():
+                val = self.tags.get(subler_key, "")
+                if val:
+                    cmd += ["-metadata", f"{ff_key}={val}"]
+
+            mk = _MEDIA_KIND.get(str(self.tags.get("Media Kind", "")))
+            if mk:
+                cmd += ["-metadata", f"media_type={mk}"]
+
+            cmd += ["-movflags", "+faststart", tmp_out]
+
+            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            _, stderr = self._proc.communicate()
+            if self._proc.returncode != 0:
+                self.log.emit(f"  ERROR (ffmpeg tags): {stderr.strip()[:300]}")
                 self.finished.emit(False)
                 return
 
             os.replace(tmp_out, self.item.dst)
-
-            # Embed artwork via ffmpeg (-c copy + -movflags +faststart) so the
-            # container is fully rebuilt with correct stco offsets.
-            # AtomicParsley was previously used here but it inserts free-atom
-            # padding into mdat without updating stco, corrupting playback.
-            if artwork_path:
-                ffmpeg = shutil.which("ffmpeg")
-                if ffmpeg:
-                    tmp_art = self.item.dst + ".artwork.mp4"
-                    r2 = self._run_proc(
-                        [ffmpeg, "-y", "-loglevel", "error",
-                         "-i", self.item.dst, "-i", artwork_path,
-                         "-c", "copy",
-                         "-map", "0", "-map", "1",
-                         "-disposition:v:1", "attached_pic",
-                         "-movflags", "+faststart",
-                         tmp_art]
-                    )
-                    if r2.returncode != 0:
-                        self.log.emit(f"  ⚠ Artwork write failed: {(r2.stderr or r2.stdout).strip()[:200]}")
-                        if os.path.exists(tmp_art):
-                            os.unlink(tmp_art)
-                    else:
-                        os.replace(tmp_art, self.item.dst)
-                        self.log.emit("  Artwork embedded.")
-                else:
-                    self.log.emit("  ⚠ ffmpeg not found — artwork skipped.")
-
             self.log.emit("  Tags written successfully.\n")
             self.finished.emit(True)
         except Exception as e:
@@ -1449,7 +1449,7 @@ class RemuxWindow(QMainWindow):
 
         key    = SettingsDialog.tmdb_key()
         subler = SettingsDialog.subler_path()
-        want_tag    = self.tag_chk.isChecked() and key and os.path.exists(subler)
+        want_tag    = self.tag_chk.isChecked() and bool(key)
         want_rename = self.rename_chk.isChecked()
 
         media = "movie" if self.media_combo.currentIndex() == 0 else "tv"
@@ -1520,8 +1520,8 @@ class RemuxWindow(QMainWindow):
                     self._append_log(f"  ⚠ Rename failed: {e}")
 
         # Tag if requested
-        subler = SettingsDialog.subler_path()
-        if self.tag_chk.isChecked() and os.path.exists(subler):
+        subler = SettingsDialog.subler_path()  # passed through for API compat; no longer used
+        if self.tag_chk.isChecked():
             item.status = S_ARTWORK
             self._set_status_cell(item.row, item.status)
 
