@@ -538,6 +538,7 @@ _MEDIA_KIND = {"Movie": "9", "9": "9", "10": "10"}
 class TagWriteWorker(QThread):
     """Downloads artwork and writes tags+artwork in a single ffmpeg pass."""
     log      = pyqtSignal(str)
+    progress = pyqtSignal(int)
     finished = pyqtSignal(bool)
 
     def __init__(self, item: QueueItem, tags: dict, artwork_url: Optional[str], subler: str):
@@ -583,11 +584,21 @@ class TagWriteWorker(QThread):
             if mk:
                 cmd += ["-metadata", f"media_type={mk}"]
 
-            cmd += ["-movflags", "+faststart", tmp_out]
+            cmd += ["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", tmp_out]
 
+            file_size = os.path.getsize(self.item.dst)
             self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            _, stderr = self._proc.communicate()
+            stderr_lines = []
+            for line in self._proc.stdout:
+                line = line.strip()
+                m = re.match(r"total_size=(\d+)", line)
+                if m and file_size > 0:
+                    self.progress.emit(min(int(int(m.group(1)) / file_size * 100), 99))
+                elif line == "progress=end":
+                    self.progress.emit(100)
+            self._proc.wait()
             if self._proc.returncode != 0:
+                stderr = self._proc.stderr.read()
                 self.log.emit(f"  ERROR (ffmpeg tags): {stderr.strip()[:300]}")
                 self.finished.emit(False)
                 return
@@ -1548,6 +1559,7 @@ class RemuxWindow(QMainWindow):
 
             w = TagWriteWorker(item, tags, artwork_url, subler)
             w.log.connect(self._append_log)
+            w.progress.connect(self.progress.setValue)
             w.finished.connect(lambda ok, it=item: self._on_tag_done(it, ok))
             self._tag_workers.append(w)
             self._tag_worker = w
