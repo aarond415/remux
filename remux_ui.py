@@ -1048,19 +1048,21 @@ class RemuxWindow(QMainWindow):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Input file", "Output file", "Codec info", "Status"])
         h = self.table.horizontalHeader()
-        h.setSectionResizeMode(COL_INPUT,  QHeaderView.ResizeMode.Stretch)
-        h.setSectionResizeMode(COL_OUTPUT, QHeaderView.ResizeMode.Stretch)
-        h.setSectionResizeMode(COL_INFO,   QHeaderView.ResizeMode.ResizeToContents)
-        h.setSectionResizeMode(COL_STATUS, QHeaderView.ResizeMode.ResizeToContents)
+        h.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        h.setStretchLastSection(True)
+        h.setMinimumSectionSize(60)
+        self.table.setColumnWidth(COL_INPUT,  280)
+        self.table.setColumnWidth(COL_OUTPUT, 280)
+        self.table.setColumnWidth(COL_INFO,   160)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked |
                                    QAbstractItemView.EditTrigger.SelectedClicked)
-        self.table.setFixedHeight(190)
+        self.table.setMinimumHeight(150)
         self.table.verticalHeader().setVisible(False)
         self.table.setFont(QFont("Menlo", 11))
         self.table.itemChanged.connect(self._on_cell_edited)
         self.table.itemSelectionChanged.connect(self._on_selection)
-        lay.addWidget(self.table)
+        lay.addWidget(self.table, stretch=2)
 
         # Table buttons
         tbl_row = QHBoxLayout()
@@ -1144,9 +1146,10 @@ class RemuxWindow(QMainWindow):
 
         # Log
         self.log = QTextEdit()
-        self.log.setReadOnly(True); self.log.setFixedHeight(130)
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(100)
         self.log.setFont(QFont("Menlo", 11))
-        lay.addWidget(self.log)
+        lay.addWidget(self.log, stretch=1)
 
     def _apply_dark(self):
         self.setStyleSheet("""
